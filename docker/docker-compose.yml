@@ -17,6 +17,7 @@ services:
   minio:
     image: minio/minio:RELEASE.2024-01-16T16-07-38Z
     container_name: minio
+    restart: unless-stopped
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
@@ -28,11 +29,14 @@ services:
       - minio-data:/data
     networks:
       - openmetadata-net
+    mem_limit: ${MEM_MINIO:-512m}
+    cpus: ${CPUS_MINIO:-1.0}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 30s
 
   # -----------------------------------------
   # Hive Metastore Database (PostgreSQL)
@@ -40,6 +44,7 @@ services:
   hive-metastore-db:
     image: postgres:15-alpine
     container_name: hive-metastore-db
+    restart: unless-stopped
     environment:
       POSTGRES_DB: ${HIVE_METASTORE_DB_NAME:-metastore}
       POSTGRES_USER: ${HIVE_METASTORE_DB_USER:-hive}
@@ -48,11 +53,14 @@ services:
       - hive-metastore-db-data:/var/lib/postgresql/data
     networks:
       - openmetadata-net
+    mem_limit: ${MEM_HIVE_METASTORE_DB:-256m}
+    cpus: ${CPUS_HIVE_METASTORE_DB:-0.5}
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${HIVE_METASTORE_DB_USER:-hive} -d ${HIVE_METASTORE_DB_NAME:-metastore}"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 20s
 
   # -----------------------------------------
   # Hive Metastore
@@ -60,6 +68,7 @@ services:
   hive-metastore:
     image: starburstdata/hive:3.1.2-e.18
     container_name: hive-metastore
+    restart: unless-stopped
     depends_on:
       hive-metastore-db:
         condition: service_healthy
@@ -74,16 +83,19 @@ services:
       S3_ACCESS_KEY: ${AWS_ACCESS_KEY_ID:-minioadmin}
       S3_SECRET_KEY: ${AWS_SECRET_ACCESS_KEY:-minioadmin}
       S3_PATH_STYLE_ACCESS: "true"
+      JAVA_TOOL_OPTIONS: "-Xmx${HIVE_METASTORE_HEAP_SIZE:-512m}"
     ports:
       - "9083:9083"
     networks:
       - openmetadata-net
+    mem_limit: ${MEM_HIVE_METASTORE:-1g}
+    cpus: ${CPUS_HIVE_METASTORE:-1.0}
     healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 9083 || exit 1"]
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/9083' 2>/dev/null || exit 1"]
       interval: 15s
       timeout: 10s
       retries: 10
-      start_period: 60s
+      start_period: 90s
 
   # -----------------------------------------
   # Trino
@@ -91,23 +103,36 @@ services:
   trino:
     image: trinodb/trino:435
     container_name: trino
+    restart: unless-stopped
     depends_on:
       hive-metastore:
         condition: service_healthy
       minio:
         condition: service_healthy
+    environment:
+      JAVA_TOOL_OPTIONS: "-Xmx${TRINO_HEAP_SIZE:-1g} -Xms256m"
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-minioadmin}
+      S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
+    entrypoint: >
+      /bin/bash -c "
+        envsubst < /etc/trino/catalog/minio.properties.template > /etc/trino/catalog/minio.properties &&
+        exec /usr/lib/trino/bin/run-trino
+      "
     ports:
       - "8080:8080"
     volumes:
-      - ./init-trino/catalog:/etc/trino/catalog
+      - ./init-trino/catalog/minio.properties.template:/etc/trino/catalog/minio.properties.template:ro
     networks:
       - openmetadata-net
+    mem_limit: ${MEM_TRINO:-2g}
+    cpus: ${CPUS_TRINO:-2.0}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]
       interval: 15s
       timeout: 10s
-      retries: 10
-      start_period: 60s
+      retries: 15
+      start_period: 90s
 
   # -----------------------------------------
   # OpenMetadata Dependencies
@@ -115,37 +140,44 @@ services:
   openmetadata-db:
     image: postgres:15-alpine
     container_name: openmetadata-db
+    restart: unless-stopped
     environment:
-      POSTGRES_DB: openmetadata_db
-      POSTGRES_USER: openmetadata_user
-      POSTGRES_PASSWORD: openmetadata_password
+      POSTGRES_DB: ${OM_DB_NAME:-openmetadata_db}
+      POSTGRES_USER: ${OM_DB_USER:-openmetadata_user}
+      POSTGRES_PASSWORD: ${OM_DB_PASSWORD:-openmetadata_password}
     volumes:
       - openmetadata-data:/var/lib/postgresql/data
     networks:
       - openmetadata-net
+    mem_limit: ${MEM_OM_DB:-256m}
+    cpus: ${CPUS_OM_DB:-0.5}
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U openmetadata_user -d openmetadata_db"]
+      test: ["CMD-SHELL", "pg_isready -U ${OM_DB_USER:-openmetadata_user} -d ${OM_DB_NAME:-openmetadata_db}"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 20s
 
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.10.2
     container_name: elasticsearch
+    restart: unless-stopped
     environment:
       - discovery.type=single-node
       - xpack.security.enabled=false
-      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+      - ES_JAVA_OPTS=-Xms${ES_HEAP_SIZE:-512m} -Xmx${ES_HEAP_SIZE:-512m}
     ports:
       - "9200:9200"
     networks:
       - openmetadata-net
+    mem_limit: ${MEM_ELASTICSEARCH:-1g}
+    cpus: ${CPUS_ELASTICSEARCH:-1.0}
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
       interval: 15s
       timeout: 10s
       retries: 10
-      start_period: 60s
+      start_period: 90s
 
   # -----------------------------------------
   # OpenMetadata Server
@@ -153,6 +185,7 @@ services:
   openmetadata-server:
     image: openmetadata/server:1.3.4
     container_name: openmetadata-server
+    restart: unless-stopped
     depends_on:
       openmetadata-db:
         condition: service_healthy
@@ -161,14 +194,15 @@ services:
     env_file:
       - ./.env
     environment:
+      JAVA_TOOL_OPTIONS: "-Xmx${OM_HEAP_SIZE:-1g} -Xms256m"
       DB_DRIVER_CLASS: org.postgresql.Driver
       DB_SCHEME: postgresql
       DB_USE_SSL: "false"
-      DB_HOST: openmetadata-db
-      DB_PORT: 5432
-      OM_DATABASE: openmetadata_db
-      DB_USER: openmetadata_user
-      DB_USER_PASSWORD: openmetadata_password
+      DB_HOST: ${OM_DB_HOST:-openmetadata-db}
+      DB_PORT: ${OM_DB_PORT:-5432}
+      OM_DATABASE: ${OM_DB_NAME:-openmetadata_db}
+      DB_USER: ${OM_DB_USER:-openmetadata_user}
+      DB_USER_PASSWORD: ${OM_DB_PASSWORD:-openmetadata_password}
       ELASTICSEARCH_HOST: elasticsearch
       ELASTICSEARCH_PORT: 9200
       ELASTICSEARCH_SCHEME: http
@@ -180,12 +214,14 @@ services:
       - "8586:8586"
     networks:
       - openmetadata-net
+    mem_limit: ${MEM_OM_SERVER:-1500m}
+    cpus: ${CPUS_OM_SERVER:-2.0}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8585/api/v1/system/version"]
       interval: 30s
       timeout: 15s
       retries: 15
-      start_period: 120s
+      start_period: 180s
 
   # -----------------------------------------
   # MinIO Bucket Setup (one-shot)
@@ -201,14 +237,19 @@ services:
     entrypoint: ["/bin/sh", "/setup.sh"]
     networks:
       - openmetadata-net
+    mem_limit: ${MEM_MINIO_SETUP:-64m}
+    cpus: ${CPUS_MINIO_SETUP:-0.25}
     restart: on-failure
 
   # -----------------------------------------
-  # Spark App (ephemeral data generation)
+  # Spark App (ephemeral — geração de dados sintéticos)
+  # Executar a partir do diretório docker/:
+  #   docker compose --profile spark up spark-app
   # -----------------------------------------
   spark-app:
     image: bitnami/spark:3.5.1
     container_name: spark-app
+    restart: "no"
     depends_on:
       minio-setup:
         condition: service_completed_successfully
@@ -219,7 +260,7 @@ services:
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-minioadmin}
       S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
       HIVE_METASTORE_URI: thrift://hive-metastore:9083
-      NUM_ROWS: "1000"
+      NUM_ROWS: ${NUM_ROWS:-1000}
     volumes:
       - ../src/spark:/app
     working_dir: /app
@@ -233,5 +274,7 @@ services:
       "
     networks:
       - openmetadata-net
+    mem_limit: ${MEM_SPARK:-2g}
+    cpus: ${CPUS_SPARK:-4.0}
     profiles:
       - spark
